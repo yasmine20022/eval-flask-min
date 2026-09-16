@@ -3,7 +3,8 @@ kind: Service
 metadata:
   name: eval-flask-min
   labels:
-    app: eval-flask-min
+    app.kubernetes.io/name: eval-flask-min
+    app.kubernetes.io/instance: eval-flask-min
 spec:
   type: NodePort
   selector:
@@ -11,3 +12,4 @@ spec:
   ports:
   - port: 80
     targetPort: 5000
+    protocol: TCP
