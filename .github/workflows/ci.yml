@@ -1,0 +1,161 @@
+name: CI/CD to Minikube
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          # Isolate installs in a venv so pip never hits PEP 668
+          # "externally-managed-environment" on the runner's SYSTEM Python — which
+          # happens when actions/setup-python falls back to the OS Python (common
+          # under act, and on newer Ubuntu/Debian images). If the venv module is
+          # unavailable, fall back to PIP_BREAK_SYSTEM_PACKAGES so the install
+          # still succeeds instead of failing the whole job.
+          if python -m venv .venv 2>/dev/null && [ -f .venv/bin/activate ]; then
+            . .venv/bin/activate
+            [ -n "${GITHUB_PATH:-}" ] && echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          else
+            export PIP_BREAK_SYSTEM_PACKAGES=1
+          fi
+          python -m pip install --upgrade pip
+          installed=0
+          # uv: export the full lock (incl. dev/test groups) and install system-wide.
+          if [ -f uv.lock ] || grep -qs "tool.uv" pyproject.toml; then
+            python -m pip install uv
+            if uv export --no-hashes --all-extras --all-groups -o /tmp/uv-reqs.txt 2>/dev/null; then
+              python -m pip install -r /tmp/uv-reqs.txt && installed=1
+            fi
+            if [ "$installed" = 0 ]; then uv pip install -e . && installed=1; fi
+          fi
+          # poetry: disable its own venv so deps land in the workflow venv.
+          if [ "$installed" = 0 ]; then
+            if [ -f poetry.lock ] || grep -qs "tool.poetry" pyproject.toml; then
+              python -m pip install poetry
+              poetry config virtualenvs.create false
+              poetry install --no-interaction --with dev,test || poetry install --no-interaction || true
+              installed=1
+            fi
+          fi
+          # pipenv: --system installs into the active workflow venv.
+          if [ "$installed" = 0 ] && [ -f Pipfile ]; then
+            python -m pip install pipenv
+            pipenv install --dev --system --deploy || pipenv install --dev --system || true
+            installed=1
+          fi
+          # Fallback: requirements*.txt + pyproject extras / PEP 735 groups.
+          if [ "$installed" = 0 ]; then
+            [ -f requirements.txt ] && python -m pip install -r requirements.txt
+            for req in requirements-dev.txt requirements-test.txt requirements-tests.txt \
+                       dev-requirements.txt test-requirements.txt \
+                       requirements/dev.txt requirements/test.txt requirements/tests.txt; do
+              [ -f "$req" ] && python -m pip install -r "$req"
+            done
+            if [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then
+              python -m pip install --group dev --group test 2>/dev/null \
+                || python -m pip install -e ".[test]" || python -m pip install -e ".[tests]" \
+                || python -m pip install -e ".[dev]" || python -m pip install -e . || true
+            fi
+          fi
+      - name: Build Docker image
+        run: docker build -t eval-flask-min:latest .
+
+  deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Start Minikube
+        uses: medyagh/setup-minikube@latest
+      - name: Build image inside Minikube
+        run: |
+          eval $(minikube docker-env)
+          docker build -t eval-flask-min:latest .
+      - name: Create Kubernetes manifest
+        run: |
+          mkdir -p /tmp/devops-autopilot-k8s
+          cat > /tmp/devops-autopilot-k8s/deployment.yaml <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: eval-flask-min
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: eval-flask-min
+            template:
+              metadata:
+                labels:
+                  app: eval-flask-min
+              spec:
+                containers:
+                  - name: eval-flask-min
+                    image: eval-flask-min:latest
+                    imagePullPolicy: Never
+                    ports:
+                      - containerPort: 5000
+                    readinessProbe:
+                      tcpSocket:
+                        port: 5000
+                      initialDelaySeconds: 5
+                      periodSeconds: 5
+                    livenessProbe:
+                      tcpSocket:
+                        port: 5000
+                      initialDelaySeconds: 15
+                      periodSeconds: 10
+          EOF
+      - name: Deploy to Minikube
+        run: |
+          if [ -d k8s ]; then
+            kubectl apply -f k8s/
+          else
+            kubectl apply -f /tmp/devops-autopilot-k8s/deployment.yaml
+          fi
+      - name: Expose app inside cluster
+        run: |
+          kubectl expose deployment eval-flask-min \
+            --name=eval-flask-min \
+            --type=ClusterIP \
+            --port=80 \
+            --target-port=5000 \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/eval-flask-min --timeout=120s
+      - name: Smoke test deployed app
+        run: |
+          kubectl port-forward service/eval-flask-min 18080:80 > /tmp/eval-flask-min-port-forward.log 2>&1 &
+          PF_PID=$!
+          trap 'kill $PF_PID 2>/dev/null || true' EXIT
+
+          for path in /health /health/ /; do
+            for attempt in $(seq 1 20); do
+              if curl -fsS "http://127.0.0.1:18080$path" >/tmp/eval-flask-min-response.txt; then
+                echo "Smoke test passed on $path"
+                exit 0
+              fi
+              sleep 2
+            done
+          done
+
+          echo "Smoke test failed: app did not return a successful HTTP response."
+          cat /tmp/eval-flask-min-port-forward.log || true
+          kubectl get pods -o wide
+          kubectl describe deployment eval-flask-min
+          kubectl logs deployment/eval-flask-min --tail=100 || true
+          exit 1
