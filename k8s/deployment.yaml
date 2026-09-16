@@ -3,16 +3,28 @@ kind: Deployment
 metadata:
   name: eval-flask-min
   labels:
-    app: eval-flask-min
+    app.kubernetes.io/name: eval-flask-min
+    app.kubernetes.io/instance: eval-flask-min
+    app.kubernetes.io/version: '1.0'
+    app.kubernetes.io/part-of: eval-flask-min
 spec:
   replicas: 1
   selector:
     matchLabels:
       app: eval-flask-min
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
   template:
     metadata:
       labels:
         app: eval-flask-min
+        app.kubernetes.io/name: eval-flask-min
+        app.kubernetes.io/instance: eval-flask-min
+        app.kubernetes.io/version: '1.0'
+        app.kubernetes.io/part-of: eval-flask-min
     spec:
       containers:
       - name: eval-flask-min
@@ -22,8 +34,30 @@ spec:
         - containerPort: 5000
         resources:
           requests:
-            memory: 256Mi
             cpu: 250m
+            memory: 256Mi
           limits:
-            memory: 512Mi
             cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          periodSeconds: 10
+          failureThreshold: 30
