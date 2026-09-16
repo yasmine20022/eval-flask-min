@@ -1,4 +1,5 @@
 name: CI/CD to Minikube
+
 on:
   push:
     branches: [main, master]
@@ -11,12 +12,19 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Set up Python
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install dependencies
         run: |
+          # Isolate installs in a venv so pip never hits PEP 668
+          # "externally-managed-environment" on the runner's SYSTEM Python — which
+          # happens when actions/setup-python falls back to the OS Python (common
+          # under act, and on newer Ubuntu/Debian images). If the venv module is
+          # unavailable, fall back to PIP_BREAK_SYSTEM_PACKAGES so the install
+          # still succeeds instead of failing the whole job.
           if python -m venv .venv 2>/dev/null && [ -f .venv/bin/activate ]; then
             . .venv/bin/activate
             [ -n "${GITHUB_PATH:-}" ] && echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
@@ -25,6 +33,7 @@ jobs:
           fi
           python -m pip install --upgrade pip
           installed=0
+          # uv: export the full lock (incl. dev/test groups) and install system-wide.
           if [ -f uv.lock ] || grep -qs "tool.uv" pyproject.toml; then
             python -m pip install uv
             if uv export --no-hashes --all-extras --all-groups -o /tmp/uv-reqs.txt 2>/dev/null; then
@@ -32,6 +41,7 @@ jobs:
             fi
             if [ "$installed" = 0 ]; then uv pip install -e . && installed=1; fi
           fi
+          # poetry: disable its own venv so deps land in the workflow venv.
           if [ "$installed" = 0 ]; then
             if [ -f poetry.lock ] || grep -qs "tool.poetry" pyproject.toml; then
               python -m pip install poetry
@@ -40,11 +50,13 @@ jobs:
               installed=1
             fi
           fi
+          # pipenv: --system installs into the active workflow venv.
           if [ "$installed" = 0 ] && [ -f Pipfile ]; then
             python -m pip install pipenv
             pipenv install --dev --system --deploy || pipenv install --dev --system || true
             installed=1
           fi
+          # Fallback: requirements*.txt + pyproject extras / PEP 735 groups.
           if [ "$installed" = 0 ]; then
             [ -f requirements.txt ] && python -m pip install -r requirements.txt
             for req in requirements-dev.txt requirements-test.txt requirements-tests.txt \
@@ -58,6 +70,8 @@ jobs:
                 || python -m pip install -e ".[dev]" || python -m pip install -e . || true
             fi
           fi
+      - name: Build Docker image
+        run: docker build -t eval-flask-min:latest .
 
   deploy:
     needs: build-and-test
